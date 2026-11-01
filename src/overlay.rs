@@ -86,9 +86,53 @@ struct Hit {
     primary: bool,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct Rgb {
+    r: u8,
+    g: u8,
+    b: u8,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PenKind {
+    Color(usize),
+    Width(usize),
+}
+
+struct PenHit {
+    rect: RECT,
+    kind: PenKind,
+}
+
+const PEN_COLORS: [Rgb; 4] = [
+    Rgb {
+        r: 208,
+        g: 48,
+        b: 42,
+    },
+    Rgb {
+        r: 232,
+        g: 186,
+        b: 48,
+    },
+    Rgb {
+        r: 244,
+        g: 244,
+        b: 242,
+    },
+    Rgb {
+        r: 18,
+        g: 18,
+        b: 18,
+    },
+];
+
+const PEN_WIDTHS: [f32; 3] = [2.0, 4.0, 8.0];
+
 struct Stroke {
     pts: Vec<(i32, i32)>,
     width: i32,
+    color: Rgb,
 }
 
 struct Overlay {
@@ -122,6 +166,10 @@ struct Overlay {
     drawing: bool,
     draw_arm: bool,
     draw_chips: Vec<RECT>,
+    pen_color: usize,
+    pen_width: usize,
+    pen_hits: Vec<PenHit>,
+    pen_arm: Option<PenKind>,
     strokes: Vec<Stroke>,
     pen: Option<Stroke>,
     monitors: Vec<PxRect>,
@@ -219,6 +267,10 @@ fn run_inner(shot: Shot) -> End {
         drawing: false,
         draw_arm: false,
         draw_chips: Vec::new(),
+        pen_color: 0,
+        pen_width: 1,
+        pen_hits: Vec::new(),
+        pen_arm: None,
         strokes: Vec::new(),
         pen: None,
         monitors,
@@ -630,10 +682,16 @@ impl Overlay {
 
     fn begin_pen(&mut self, x: i32, y: i32) {
         let scale = self.scale_at(x, y);
-        let width = (3.0 * scale).round().clamp(2.0, 8.0) as i32;
+        let preset = PEN_WIDTHS.get(self.pen_width).copied().unwrap_or(4.0);
+        let width = (preset * scale).round().clamp(1.0, 28.0) as i32;
+        let color = PEN_COLORS
+            .get(self.pen_color)
+            .copied()
+            .unwrap_or(PEN_COLORS[0]);
         self.pen = Some(Stroke {
             pts: vec![(x, y)],
             width,
+            color,
         });
         self.anchor = None;
         self.dragged = false;
@@ -674,6 +732,23 @@ impl Overlay {
         self.draw_chips
             .iter()
             .any(|rect| x >= rect.left && x < rect.right && y >= rect.top && y < rect.bottom)
+    }
+
+    fn pen_kind_at(&self, x: i32, y: i32) -> Option<PenKind> {
+        self.pen_hits
+            .iter()
+            .find(|hit| {
+                x >= hit.rect.left && x < hit.rect.right && y >= hit.rect.top && y < hit.rect.bottom
+            })
+            .map(|hit| hit.kind)
+    }
+
+    fn apply_pen(&mut self, kind: PenKind) {
+        match kind {
+            PenKind::Color(index) if index < PEN_COLORS.len() => self.pen_color = index,
+            PenKind::Width(index) if index < PEN_WIDTHS.len() => self.pen_width = index,
+            _ => {}
+        }
     }
 
     fn baked(&self, sel: PxRect) -> Option<Vec<u8>> {
@@ -852,6 +927,7 @@ impl Overlay {
             self.paint_corner(hdc);
             self.paint_cursor(hdc);
             self.paint_status(hdc);
+            self.paint_pen_box(hdc);
             BitBlt(
                 window,
                 0,
@@ -885,7 +961,7 @@ impl Overlay {
     }
 
     fn over_button(&self, x: i32, y: i32) -> bool {
-        self.hit_button(x, y).is_some() || self.hit_draw(x, y)
+        self.hit_button(x, y).is_some() || self.hit_draw(x, y) || self.pen_kind_at(x, y).is_some()
     }
 
     fn paint_words(&self, hdc: HDC) {
@@ -1239,6 +1315,128 @@ impl Overlay {
         }
     }
 
+    fn paint_pen_box(&mut self, hdc: HDC) {
+        self.pen_hits.clear();
+        if !self.drawing {
+            return;
+        }
+        let (cx, cy) = self.cursor();
+        let Some(mon) = self.monitor_at(cx, cy) else {
+            return;
+        };
+        let scale = self.scale_at(mon.x + mon.w / 2, mon.y + mon.h / 2);
+        let pad = (8.0 * scale).round().max(6.0) as i32;
+        let swatch = (16.0 * scale).round().max(12.0) as i32;
+        let gap = (6.0 * scale).round().max(4.0) as i32;
+        let sep = (14.0 * scale).round().max(10.0) as i32;
+        let thick = (26.0 * scale).round().max(20.0) as i32;
+        let margin = (16.0 * scale).round().max(10.0) as i32;
+        let colors = PEN_COLORS.len() as i32;
+        let widths = PEN_WIDTHS.len() as i32;
+        let colors_w = colors * swatch + (colors - 1) * gap;
+        let widths_w = widths * thick + (widths - 1) * gap;
+        let box_w = pad * 2 + colors_w + sep + widths_w;
+        let box_h = pad * 2 + swatch;
+        if box_w > mon.w - 8 || box_h > mon.h - 8 {
+            return;
+        }
+        let left = mon.x + (mon.w - box_w) / 2;
+        let top = mon.y + margin;
+        let outer = RECT {
+            left,
+            top,
+            right: left + box_w,
+            bottom: top + box_h,
+        };
+        unsafe {
+            FillRect(hdc, &outer, self.black);
+            FrameRect(hdc, &outer, self.pale);
+        }
+        let y = top + pad;
+        let mut x = left + pad;
+        for (index, color) in PEN_COLORS.iter().enumerate() {
+            let cell = RECT {
+                left: x,
+                top: y,
+                right: x + swatch,
+                bottom: y + swatch,
+            };
+            let hot = cx >= cell.left && cx < cell.right && cy >= cell.top && cy < cell.bottom;
+            self.paint_swatch(hdc, cell, *color, index == self.pen_color, hot);
+            self.pen_hits.push(PenHit {
+                rect: cell,
+                kind: PenKind::Color(index),
+            });
+            x += swatch + gap;
+        }
+        let line_x = left + pad + colors_w + sep / 2;
+        let line = RECT {
+            left: line_x,
+            top: y + 2,
+            right: line_x + 1,
+            bottom: y + swatch - 2,
+        };
+        unsafe {
+            FillRect(hdc, &line, self.gray);
+        }
+        x = left + pad + colors_w + sep;
+        for (index, preset) in PEN_WIDTHS.iter().enumerate() {
+            let cell = RECT {
+                left: x,
+                top: y,
+                right: x + thick,
+                bottom: y + swatch,
+            };
+            let hot = cx >= cell.left && cx < cell.right && cy >= cell.top && cy < cell.bottom;
+            let bar = (*preset * scale)
+                .round()
+                .clamp(1.0, (swatch - 6).max(1) as f32) as i32;
+            self.paint_weight(hdc, cell, bar, index == self.pen_width, hot);
+            self.pen_hits.push(PenHit {
+                rect: cell,
+                kind: PenKind::Width(index),
+            });
+            x += thick + gap;
+        }
+    }
+
+    fn paint_swatch(&self, hdc: HDC, cell: RECT, color: Rgb, on: bool, hot: bool) {
+        unsafe {
+            if on {
+                FillRect(hdc, &cell, self.pale);
+                fill_color(hdc, inflate(cell, -2), color);
+            } else {
+                fill_color(hdc, cell, color);
+                FrameRect(hdc, &cell, if hot { self.white } else { self.gray });
+            }
+        }
+    }
+
+    fn paint_weight(&self, hdc: HDC, cell: RECT, bar: i32, on: bool, hot: bool) {
+        unsafe {
+            if on {
+                FillRect(hdc, &cell, self.pale);
+            } else {
+                FrameRect(hdc, &cell, if hot { self.white } else { self.pale });
+            }
+        }
+        let span = cell.right - cell.left;
+        let inset = (span / 5).clamp(3, 8);
+        let bar_w = (span - inset * 2).max(4);
+        let bar_h = bar.clamp(1, (cell.bottom - cell.top - 4).max(1));
+        let cx = cell.left + span / 2;
+        let cy = (cell.top + cell.bottom) / 2;
+        let mark = RECT {
+            left: cx - bar_w / 2,
+            top: cy - bar_h / 2,
+            right: cx - bar_w / 2 + bar_w,
+            bottom: cy - bar_h / 2 + bar_h,
+        };
+        unsafe {
+            FillRect(hdc, &mark, if on { self.black } else { self.white });
+        }
+    }
+
     fn paint_status(&mut self, hdc: HDC) {
         if self.status.is_empty() {
             return;
@@ -1305,8 +1503,44 @@ fn paint_stroke(hdc: HDC, stroke: &Stroke, ox: i32, oy: i32) {
         return;
     }
     let ink = stroke.width.max(1);
-    stroke_path(hdc, &stroke.pts, ox, oy, ink + 2, gdi::bgr(0, 0, 0));
-    stroke_path(hdc, &stroke.pts, ox, oy, ink, gdi::bgr(186, 206, 220));
+    let halo = ink_halo(stroke.color);
+    stroke_path(
+        hdc,
+        &stroke.pts,
+        ox,
+        oy,
+        ink + 2,
+        gdi::bgr(halo.r, halo.g, halo.b),
+    );
+    stroke_path(
+        hdc,
+        &stroke.pts,
+        ox,
+        oy,
+        ink,
+        gdi::bgr(stroke.color.r, stroke.color.g, stroke.color.b),
+    );
+}
+
+fn ink_halo(color: Rgb) -> Rgb {
+    let y = color.r as u16 * 3 + color.g as u16 * 6 + color.b as u16;
+    if y < 1400 {
+        Rgb {
+            r: 244,
+            g: 244,
+            b: 242,
+        }
+    } else {
+        Rgb { r: 0, g: 0, b: 0 }
+    }
+}
+
+fn fill_color(hdc: HDC, rect: RECT, color: Rgb) {
+    unsafe {
+        let brush = CreateSolidBrush(gdi::bgr(color.r, color.g, color.b));
+        FillRect(hdc, &rect, brush);
+        DeleteObject(brush);
+    }
 }
 
 fn stroke_path(hdc: HDC, pts: &[(i32, i32)], ox: i32, oy: i32, width: i32, color: COLORREF) {
@@ -1462,7 +1696,10 @@ unsafe extern "system" fn proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPA
             }
             WM_SETCURSOR => {
                 let (x, y) = overlay.cursor();
-                let id = if overlay.hit_button(x, y).is_some() || overlay.hit_draw(x, y) {
+                let id = if overlay.hit_button(x, y).is_some()
+                    || overlay.hit_draw(x, y)
+                    || overlay.pen_kind_at(x, y).is_some()
+                {
                     IDC_ARROW
                 } else if !overlay.drawing
                     && !overlay.words.is_empty()
@@ -1479,6 +1716,12 @@ unsafe extern "system" fn proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPA
             WM_LBUTTONDOWN => {
                 SetCapture(hwnd);
                 let (x, y) = overlay.cursor();
+                if let Some(kind) = overlay.pen_kind_at(x, y) {
+                    overlay.pen_arm = Some(kind);
+                    overlay.anchor = None;
+                    overlay.button_arm = None;
+                    return 0;
+                }
                 if overlay.hit_draw(x, y) {
                     overlay.draw_arm = true;
                     overlay.anchor = None;
@@ -1549,6 +1792,13 @@ unsafe extern "system" fn proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPA
             WM_LBUTTONUP => {
                 ReleaseCapture();
                 let (x, y) = overlay.cursor();
+                if let Some(kind) = overlay.pen_arm.take() {
+                    if overlay.pen_kind_at(x, y) == Some(kind) {
+                        overlay.apply_pen(kind);
+                    }
+                    overlay.invalidate();
+                    return 0;
+                }
                 if overlay.draw_arm {
                     overlay.draw_arm = false;
                     if overlay.hit_draw(x, y) {
@@ -1590,7 +1840,11 @@ unsafe extern "system" fn proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPA
             }
             WM_LBUTTONDBLCLK => {
                 let (x, y) = overlay.cursor();
-                if overlay.drawing || overlay.hit_draw(x, y) || overlay.hit_button(x, y).is_some() {
+                if overlay.drawing
+                    || overlay.hit_draw(x, y)
+                    || overlay.hit_button(x, y).is_some()
+                    || overlay.pen_kind_at(x, y).is_some()
+                {
                     return 0;
                 }
                 if overlay.clamped().is_some() {
@@ -1649,6 +1903,11 @@ mod tests {
             &Stroke {
                 pts: vec![(2, 16), (29, 16)],
                 width: 3,
+                color: Rgb {
+                    r: 186,
+                    g: 206,
+                    b: 220,
+                },
             },
             0,
             0,
