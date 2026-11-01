@@ -24,7 +24,7 @@ The mark is [`docs/mark.svg`](docs/mark.svg).
 | Alt + Print Screen | Takes the foreground window. If that window is Lens, it falls back to the full freeze. |
 | Win or Ctrl + Print Screen | Left to Windows. |
 
-Escape clears the rectangle, then leaves the freeze. The arrows nudge one pixel. Shift makes that ten. K copies the color under the cursor as `#RRGGBB`.
+Escape leaves the pen, then clears the rectangle, then leaves the freeze. The arrows nudge one pixel. Shift makes that ten. K copies the color under the cursor as `#RRGGBB`. D draws on the freeze, and the stroke stays in the copy. Ctrl+Z removes the last stroke.
 
 The freeze offers Copier, Texte, Lens, Sauver, and Épingler. Web appears once words are on the rectangle.
 

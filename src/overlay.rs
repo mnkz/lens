@@ -3,13 +3,14 @@ use std::sync::mpsc::{self, Receiver};
 
 use windows_sys::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, POINT, RECT, SIZE, WPARAM};
 use windows_sys::Win32::Graphics::Gdi::{
-    AC_SRC_OVER, AlphaBlend, BLENDFUNCTION, BeginPaint, BitBlt, ClientToScreen, CreateFontW,
-    CreatePen, CreateSolidBrush, DT_CENTER, DT_END_ELLIPSIS, DT_NOPREFIX, DT_SINGLELINE,
-    DT_VCENTER, DeleteObject, DrawTextW, Ellipse, EndPaint, FillRect, FrameRect, GdiFlush,
-    GetStockObject, GetTextExtentPoint32W, HALFTONE, HBRUSH, HDC, HFONT, HOLLOW_BRUSH,
-    InvalidateRect, MONITOR_DEFAULTTONEAREST, MonitorFromPoint, PS_SOLID, SRCCOPY, ScreenToClient,
-    SelectObject, SetBkMode, SetBrushOrgEx, SetStretchBltMode, SetTextColor, StretchBlt,
-    TRANSPARENT, UpdateWindow,
+    AC_SRC_OVER, AlphaBlend, BLENDFUNCTION, BS_SOLID, BeginPaint, BitBlt, ClientToScreen,
+    CreateFontW, CreatePen, CreateSolidBrush, DT_CENTER, DT_END_ELLIPSIS, DT_NOPREFIX,
+    DT_SINGLELINE, DT_VCENTER, DeleteObject, DrawTextW, Ellipse, EndPaint, ExtCreatePen, FillRect,
+    FrameRect, GdiFlush, GetDC, GetStockObject, GetTextExtentPoint32W, HALFTONE, HBRUSH, HDC,
+    HFONT, HOLLOW_BRUSH, InvalidateRect, LOGBRUSH, MONITOR_DEFAULTTONEAREST, MonitorFromPoint,
+    NULL_PEN, PS_ENDCAP_ROUND, PS_GEOMETRIC, PS_JOIN_ROUND, PS_SOLID, Polyline, ReleaseDC, SRCCOPY,
+    ScreenToClient, SelectObject, SetBkMode, SetBrushOrgEx, SetStretchBltMode, SetTextColor,
+    StretchBlt, TRANSPARENT, UpdateWindow,
 };
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows_sys::Win32::System::Threading::{AttachThreadInput, GetCurrentThreadId};
@@ -85,6 +86,11 @@ struct Hit {
     primary: bool,
 }
 
+struct Stroke {
+    pts: Vec<(i32, i32)>,
+    width: i32,
+}
+
 struct Overlay {
     hwnd: HWND,
     shot_w: i32,
@@ -113,6 +119,11 @@ struct Overlay {
     text_drag: bool,
     buttons: Vec<Hit>,
     button_arm: Option<usize>,
+    drawing: bool,
+    draw_arm: bool,
+    draw_chips: Vec<RECT>,
+    strokes: Vec<Stroke>,
+    pen: Option<Stroke>,
     monitors: Vec<PxRect>,
     status: String,
     ocr_please: bool,
@@ -205,6 +216,11 @@ fn run_inner(shot: Shot) -> End {
         text_drag: false,
         buttons: Vec::new(),
         button_arm: None,
+        drawing: false,
+        draw_arm: false,
+        draw_chips: Vec::new(),
+        strokes: Vec::new(),
+        pen: None,
         monitors,
         status: String::new(),
         ocr_please: false,
@@ -516,7 +532,8 @@ impl Overlay {
             }
             return;
         }
-        let Some(bgra) = pixels::crop(&self.bgra, self.shot_w, sel) else {
+        self.finish_pen(Some(self.cursor()));
+        let Some(bgra) = self.baked(sel) else {
             return;
         };
         self.outcome = Some(Grab {
@@ -545,6 +562,15 @@ impl Overlay {
     }
 
     fn on_escape(&mut self) {
+        if self.pen.take().is_some() {
+            self.invalidate();
+            return;
+        }
+        if self.drawing {
+            self.drawing = false;
+            self.invalidate();
+            return;
+        }
         if self.text_anchor.is_some() {
             self.text_anchor = None;
             self.text_current = None;
@@ -591,12 +617,112 @@ impl Overlay {
             'p' | 'P' => self.commit(CloseAction::Pin),
             'w' | 'W' => self.commit(CloseAction::Web),
             'k' | 'K' => self.copy_color(),
+            'd' | 'D' => self.toggle_draw(),
             _ => {}
         }
     }
 
+    fn toggle_draw(&mut self) {
+        self.finish_pen(Some(self.cursor()));
+        self.drawing = !self.drawing;
+        self.invalidate();
+    }
+
+    fn begin_pen(&mut self, x: i32, y: i32) {
+        let scale = self.scale_at(x, y);
+        let width = (3.0 * scale).round().clamp(2.0, 8.0) as i32;
+        self.pen = Some(Stroke {
+            pts: vec![(x, y)],
+            width,
+        });
+        self.anchor = None;
+        self.dragged = false;
+        self.text_drag = false;
+        self.button_arm = None;
+    }
+
+    fn extend_pen(&mut self, x: i32, y: i32) {
+        let Some(pen) = &mut self.pen else {
+            return;
+        };
+        let Some((lx, ly)) = pen.pts.last().copied() else {
+            pen.pts.push((x, y));
+            return;
+        };
+        let dx = x - lx;
+        let dy = y - ly;
+        if dx * dx + dy * dy >= 4 {
+            pen.pts.push((x, y));
+        }
+    }
+
+    fn finish_pen(&mut self, at: Option<(i32, i32)>) {
+        let Some(mut stroke) = self.pen.take() else {
+            return;
+        };
+        if let Some((x, y)) = at
+            && stroke.pts.last().copied() != Some((x, y))
+        {
+            stroke.pts.push((x, y));
+        }
+        if !stroke.pts.is_empty() {
+            self.strokes.push(stroke);
+        }
+    }
+
+    fn hit_draw(&self, x: i32, y: i32) -> bool {
+        self.draw_chips
+            .iter()
+            .any(|rect| x >= rect.left && x < rect.right && y >= rect.top && y < rect.bottom)
+    }
+
+    fn baked(&self, sel: PxRect) -> Option<Vec<u8>> {
+        let mut bgra = pixels::crop(&self.bgra, self.shot_w, sel)?;
+        let has_ink = self.strokes.iter().any(|stroke| !stroke.pts.is_empty())
+            || self
+                .pen
+                .as_ref()
+                .is_some_and(|stroke| !stroke.pts.is_empty());
+        if !has_ink {
+            return Some(bgra);
+        }
+        let screen = unsafe { GetDC(std::ptr::null_mut()) };
+        if screen.is_null() {
+            return Some(bgra);
+        }
+        let dib = Dib::new(screen, &bgra, sel.w, sel.h);
+        unsafe { ReleaseDC(std::ptr::null_mut(), screen) };
+        let Ok(dib) = dib else {
+            return Some(bgra);
+        };
+        self.paint_ink(dib.dc, -sel.x, -sel.y);
+        unsafe {
+            GdiFlush();
+            let len = (sel.w as usize)
+                .saturating_mul(sel.h as usize)
+                .saturating_mul(4);
+            if !dib.bits.is_null() && len == bgra.len() {
+                std::ptr::copy_nonoverlapping(dib.bits, bgra.as_mut_ptr(), len);
+            }
+        }
+        // GDI leaves the alpha byte at zero on the pixels it paints.
+        pixels::force_opaque(&mut bgra);
+        Some(bgra)
+    }
+
     fn on_key(&mut self, vk: u16) {
         let ctrl = unsafe { GetKeyState(VK_CONTROL as i32) } < 0;
+        if ctrl && vk == b'Z' as u16 {
+            let changed = if self.pen.take().is_some() {
+                true
+            } else {
+                self.strokes.pop().is_some()
+            };
+            if changed {
+                self.invalidate();
+            }
+            return;
+        }
         if ctrl && vk == b'C' as u16 {
             let text = self.selected_text();
             if text.is_empty() {
@@ -712,6 +838,7 @@ impl Overlay {
             GdiFlush();
             self.paint_reveal();
             GdiFlush();
+            self.paint_ink(hdc, 0, 0);
             if let Some(sel) = sel {
                 self.paint_words(hdc);
                 self.paint_frame(hdc, sel);
@@ -722,7 +849,7 @@ impl Overlay {
                 self.buttons.clear();
             }
             self.paint_monitors(hdc);
-            self.paint_pipette(hdc);
+            self.paint_corner(hdc);
             self.paint_cursor(hdc);
             self.paint_status(hdc);
             BitBlt(
@@ -758,9 +885,7 @@ impl Overlay {
     }
 
     fn over_button(&self, x: i32, y: i32) -> bool {
-        self.buttons.iter().any(|hit| {
-            x >= hit.rect.left && x < hit.rect.right && y >= hit.rect.top && y < hit.rect.bottom
-        })
+        self.hit_button(x, y).is_some() || self.hit_draw(x, y)
     }
 
     fn paint_words(&self, hdc: HDC) {
@@ -922,6 +1047,9 @@ impl Overlay {
     }
 
     fn paint_cursor(&mut self, hdc: HDC) {
+        if self.drawing {
+            return;
+        }
         let (x, y) = self.cursor();
         if x < 0 || y < 0 || x >= self.shot_w || y >= self.shot_h {
             return;
@@ -1033,37 +1161,81 @@ impl Overlay {
         gdi::bgr(self.bgra[i + 2], self.bgra[i + 1], self.bgra[i])
     }
 
-    fn paint_pipette(&mut self, hdc: HDC) {
-        let label = "K pipette";
-        for mon in self.monitors.clone() {
+    fn paint_ink(&self, hdc: HDC, ox: i32, oy: i32) {
+        for stroke in &self.strokes {
+            paint_stroke(hdc, stroke, ox, oy);
+        }
+        if let Some(stroke) = &self.pen {
+            paint_stroke(hdc, stroke, ox, oy);
+        }
+    }
+
+    fn paint_corner(&mut self, hdc: HDC) {
+        self.draw_chips.clear();
+        let monitors = self.monitors.clone();
+        let (cx, cy) = self.cursor();
+        for mon in monitors {
             let scale = self.scale_at(mon.x + mon.w / 2, mon.y + mon.h / 2);
             let font = self.font_for(hdc, scale);
-            let width = text_width(hdc, font, label) + (18.0 * scale) as i32;
-            let height = (26.0 * scale) as i32;
+            let gap = (8.0 * scale) as i32;
             let margin = (16.0 * scale) as i32;
-            let left = mon.x + mon.w - width - margin;
+            let height = (26.0 * scale) as i32;
+            let pad = (18.0 * scale) as i32;
+            let draw_w = text_width(hdc, font, "D dessin") + pad;
+            let pick_w = text_width(hdc, font, "K pipette") + pad;
+            let total = draw_w + gap + pick_w;
+            let left = mon.x + mon.w - total - margin;
             let top = mon.y + mon.h - height - margin;
             if left < mon.x || top < mon.y {
                 continue;
             }
-            let rect = RECT {
+            let draw = RECT {
                 left,
                 top,
-                right: left + width,
+                right: left + draw_w,
                 bottom: top + height,
             };
-            unsafe {
-                FillRect(hdc, &rect, self.black);
-                FrameRect(hdc, &rect, self.pale);
-                text_in(
-                    hdc,
-                    font,
-                    rect,
-                    label,
-                    gdi::bgr(186, 206, 220),
-                    DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX,
-                );
-            }
+            let pick = RECT {
+                left: draw.right + gap,
+                top,
+                right: draw.right + gap + pick_w,
+                bottom: top + height,
+            };
+            let hot = cx >= draw.left && cx < draw.right && cy >= draw.top && cy < draw.bottom;
+            let on = self.drawing;
+            self.draw_chips.push(draw);
+            self.paint_chip(hdc, font, draw, "D dessin", on, hot);
+            self.paint_chip(hdc, font, pick, "K pipette", false, false);
+        }
+    }
+
+    fn paint_chip(&self, hdc: HDC, font: HFONT, rect: RECT, label: &str, on: bool, hot: bool) {
+        let fill = if on {
+            self.pale
+        } else if hot {
+            self.hover
+        } else {
+            self.black
+        };
+        let frame = if on || !hot { self.pale } else { self.white };
+        let color = if on {
+            gdi::bgr(0, 0, 0)
+        } else if hot {
+            gdi::bgr(244, 244, 242)
+        } else {
+            gdi::bgr(186, 206, 220)
+        };
+        unsafe {
+            FillRect(hdc, &rect, fill);
+            FrameRect(hdc, &rect, frame);
+            text_in(
+                hdc,
+                font,
+                rect,
+                label,
+                color,
+                DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX,
+            );
         }
     }
 
@@ -1125,6 +1297,62 @@ impl Drop for Overlay {
                 }
             }
         }
+    }
+}
+
+fn paint_stroke(hdc: HDC, stroke: &Stroke, ox: i32, oy: i32) {
+    if stroke.pts.is_empty() {
+        return;
+    }
+    let ink = stroke.width.max(1);
+    stroke_path(hdc, &stroke.pts, ox, oy, ink + 2, gdi::bgr(0, 0, 0));
+    stroke_path(hdc, &stroke.pts, ox, oy, ink, gdi::bgr(186, 206, 220));
+}
+
+fn stroke_path(hdc: HDC, pts: &[(i32, i32)], ox: i32, oy: i32, width: i32, color: COLORREF) {
+    if pts.is_empty() || width < 1 {
+        return;
+    }
+    unsafe {
+        if pts.len() == 1 {
+            let brush = CreateSolidBrush(color);
+            let old_pen = SelectObject(hdc, GetStockObject(NULL_PEN));
+            let old_brush = SelectObject(hdc, brush);
+            let (x, y) = pts[0];
+            let left = x + ox - width / 2;
+            let top = y + oy - width / 2;
+            Ellipse(hdc, left, top, left + width, top + width);
+            SelectObject(hdc, old_pen);
+            SelectObject(hdc, old_brush);
+            DeleteObject(brush);
+            return;
+        }
+        let brush = LOGBRUSH {
+            lbStyle: BS_SOLID,
+            lbColor: color,
+            lbHatch: 0,
+        };
+        let pen = ExtCreatePen(
+            (PS_GEOMETRIC | PS_ENDCAP_ROUND | PS_JOIN_ROUND | PS_SOLID) as u32,
+            width as u32,
+            &brush,
+            0,
+            std::ptr::null(),
+        );
+        if pen.is_null() {
+            return;
+        }
+        let old = SelectObject(hdc, pen);
+        let points: Vec<POINT> = pts
+            .iter()
+            .map(|(x, y)| POINT {
+                x: x + ox,
+                y: y + oy,
+            })
+            .collect();
+        Polyline(hdc, points.as_ptr(), points.len() as i32);
+        SelectObject(hdc, old);
+        DeleteObject(pen);
     }
 }
 
@@ -1234,9 +1462,10 @@ unsafe extern "system" fn proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPA
             }
             WM_SETCURSOR => {
                 let (x, y) = overlay.cursor();
-                let id = if overlay.hit_button(x, y).is_some() {
+                let id = if overlay.hit_button(x, y).is_some() || overlay.hit_draw(x, y) {
                     IDC_ARROW
-                } else if !overlay.words.is_empty()
+                } else if !overlay.drawing
+                    && !overlay.words.is_empty()
                     && overlay.sel.is_some_and(|sel| sel.contains(x, y))
                     && ocr::hit_word(&overlay.words, x as f32, y as f32).is_some()
                 {
@@ -1250,9 +1479,20 @@ unsafe extern "system" fn proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPA
             WM_LBUTTONDOWN => {
                 SetCapture(hwnd);
                 let (x, y) = overlay.cursor();
+                if overlay.hit_draw(x, y) {
+                    overlay.draw_arm = true;
+                    overlay.anchor = None;
+                    overlay.button_arm = None;
+                    return 0;
+                }
                 if let Some(index) = overlay.hit_button(x, y) {
                     overlay.button_arm = Some(index);
                     overlay.anchor = None;
+                    return 0;
+                }
+                if overlay.drawing {
+                    overlay.begin_pen(x, y);
+                    overlay.invalidate();
                     return 0;
                 }
                 if !overlay.words.is_empty()
@@ -1274,6 +1514,11 @@ unsafe extern "system" fn proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPA
             }
             WM_MOUSEMOVE => {
                 let (x, y) = overlay.cursor();
+                if overlay.pen.is_some() {
+                    overlay.extend_pen(x, y);
+                    overlay.invalidate();
+                    return 0;
+                }
                 if overlay.text_drag
                     && let Some(word) = ocr::hit_word(&overlay.words, x as f32, y as f32)
                 {
@@ -1304,6 +1549,18 @@ unsafe extern "system" fn proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPA
             WM_LBUTTONUP => {
                 ReleaseCapture();
                 let (x, y) = overlay.cursor();
+                if overlay.draw_arm {
+                    overlay.draw_arm = false;
+                    if overlay.hit_draw(x, y) {
+                        overlay.toggle_draw();
+                    }
+                    return 0;
+                }
+                if overlay.pen.is_some() {
+                    overlay.finish_pen(Some((x, y)));
+                    overlay.invalidate();
+                    return 0;
+                }
                 if let Some(index) = overlay.button_arm.take() {
                     if overlay.hit_button(x, y) == Some(index) {
                         match overlay.buttons.get(index).map(|hit| hit.cmd) {
@@ -1332,6 +1589,10 @@ unsafe extern "system" fn proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPA
                 0
             }
             WM_LBUTTONDBLCLK => {
+                let (x, y) = overlay.cursor();
+                if overlay.drawing || overlay.hit_draw(x, y) || overlay.hit_button(x, y).is_some() {
+                    return 0;
+                }
                 if overlay.clamped().is_some() {
                     overlay.commit(CloseAction::Copy);
                 }
@@ -1369,5 +1630,33 @@ unsafe extern "system" fn proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPA
             }
             _ => DefWindowProcW(hwnd, msg, wparam, lparam),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn stroke_paints_on_the_dib() {
+        let screen = unsafe { GetDC(std::ptr::null_mut()) };
+        assert!(!screen.is_null());
+        let bgra = vec![255u8; 32 * 32 * 4];
+        let dib = Dib::new(screen, &bgra, 32, 32).expect("dib");
+        unsafe { ReleaseDC(std::ptr::null_mut(), screen) };
+        paint_stroke(
+            dib.dc,
+            &Stroke {
+                pts: vec![(2, 16), (29, 16)],
+                width: 3,
+            },
+            0,
+            0,
+        );
+        unsafe { GdiFlush() };
+        let px = unsafe { std::slice::from_raw_parts(dib.bits, bgra.len()) };
+        let i = (16 * 32 + 16) * 4;
+        assert_eq!(&px[i..i + 3], &[186, 206, 220]);
+        assert_eq!(&px[0..3], &[255, 255, 255]);
     }
 }
